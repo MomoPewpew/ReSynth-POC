@@ -91,8 +91,16 @@ def interpolate_parameters(
     t: float,
     *,
     n_grid: int | None = None,
+    phase_mode: str = "keep_a",
+    blend_duration: bool = False,
 ) -> dict[str, Any]:
-    """Return parameters at morph amount t (0=A, 1=B)."""
+    """Return parameters at morph amount t (0=A, 1=B).
+
+    phase_mode:
+      keep_a — use A's measured phase (good for same-pitch / velocity morphs)
+      residual_blend — IF(freq) + lerp(phase residuals); needed when pitch changes
+        (horizontal interpolation across the keyboard)
+    """
     t = float(np.clip(t, 0.0, 1.0))
     if t <= 0.0:
         return copy.deepcopy(params_a)
@@ -103,9 +111,7 @@ def interpolate_parameters(
     b = params_b
     dur_a = float(a["meta"]["duration"])
     dur_b = float(b["meta"]["duration"])
-    # Keep A's duration. Stretching/compressing while reusing STFT phases
-    # desynchronizes phase from frequency and produces metallic/bell tones.
-    dur = dur_a
+    dur = _lerp(dur_a, dur_b, t) if blend_duration else dur_a
     sr_a = int(a["meta"]["sample_rate"])
     sr_b = int(b["meta"]["sample_rate"])
     if sr_a != sr_b:
@@ -169,13 +175,33 @@ def interpolate_parameters(
         amp_b = _resample_on_unit(times_b, pb["amplitude"], dur_b, unit)
         amp = _log1p_lerp(amp_a, amp_b, t)
 
-        # Independently recorded notes have unrelated absolute phases.
-        # Lerping those phases (or mixing one note's phase with another's
-        # frequencies) creates metallic/bell artifacts. Keep A's measured
-        # phase for all interior morphs; t=0/t=1 use exact endpoints via
-        # early return above.
         phase_raw_a = pa.get("phase") or [0.0]
-        if len(phase_raw_a) >= 2:
+        phase_raw_b = pb.get("phase") or [0.0]
+
+        if phase_mode == "residual_blend" and len(phase_raw_a) >= 2 and len(phase_raw_b) >= 2:
+            # phase residual relative to each endpoint's own IF, then apply to blended freq
+            abs_a = unit * dur_a
+            abs_b = unit * dur_b
+            abs_m = unit * dur
+
+            def _if_on_grid(freq: NDArray, abs_t: NDArray, phase0: float) -> NDArray:
+                dt = np.diff(abs_t, prepend=abs_t[0])
+                if len(dt) > 1:
+                    dt[0] = dt[1]
+                ip = phase0 + np.cumsum(2.0 * np.pi * freq * dt)
+                return ip - ip[0] + phase0
+
+            ph_a = _resample_on_unit(times_a, np.unwrap(_as_f64(phase_raw_a)), dur_a, unit)
+            ph_b = _resample_on_unit(times_b, np.unwrap(_as_f64(phase_raw_b)), dur_b, unit)
+            res_a = ph_a - _if_on_grid(freq_a, abs_a, float(ph_a[0]))
+            res_b = ph_b - _if_on_grid(freq_b, abs_b, float(ph_b[0]))
+            residual = _lerp_arr(res_a, res_b, t)
+            phase0 = float(
+                np.angle((1.0 - t) * np.exp(1j * ph_a[0]) + t * np.exp(1j * ph_b[0]))
+            )
+            phase = (_if_on_grid(freq, abs_m, phase0) + residual).tolist()
+        elif len(phase_raw_a) >= 2:
+            # Default: keep A's measured phase (same-pitch morphs)
             phase = _resample_on_unit(
                 times_a, np.unwrap(_as_f64(phase_raw_a)), dur_a, unit
             ).tolist()
