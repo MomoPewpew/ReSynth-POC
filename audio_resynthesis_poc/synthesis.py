@@ -18,39 +18,115 @@ def _interp(times: list | NDArray, values: list | NDArray, query: NDArray) -> ND
     return np.interp(query, t, v).astype(np.float64)
 
 
+def _mq_cubic_phase_segment(
+    phase0: float,
+    phase1: float,
+    f0: float,
+    f1: float,
+    n_samples: int,
+    sample_rate: int,
+) -> NDArray:
+    """McAulay–Quatieri cubic phase between two control points."""
+    if n_samples <= 0:
+        return np.zeros(0, dtype=np.float64)
+    T = n_samples / float(sample_rate)
+    if T <= 0:
+        return np.full(n_samples, phase0, dtype=np.float64)
+
+    w0 = 2.0 * np.pi * f0
+    w1 = 2.0 * np.pi * f1
+    M = int(np.round(((phase1 - phase0) - 0.5 * (w0 + w1) * T) / (2.0 * np.pi)))
+    ph1 = phase1 - 2.0 * np.pi * M
+
+    a0 = phase0
+    a1 = w0
+    a2 = (3.0 * (ph1 - phase0) - (2.0 * w0 + w1) * T) / (T * T)
+    a3 = (2.0 * (phase0 - ph1) + (w0 + w1) * T) / (T * T * T)
+
+    t = np.arange(n_samples, dtype=np.float64) / sample_rate
+    return a0 + a1 * t + a2 * t**2 + a3 * t**3
+
+
+def _synthesize_partials_stft(
+    params: dict[str, Any],
+    n: int,
+    sr: int,
+) -> NDArray:
+    """Rebuild a sparse harmonic STFT from partial control points and ISTFT.
+
+    More robust than time-domain oscillators for real instrument tones.
+    Still parametric: only control-point amp/freq/phase are used (no PCM).
+    """
+    import librosa
+
+    cfg = params.get("analysis_config") or {}
+    n_fft = int(cfg.get("stft_n_fft", 4096))
+    hop = int(cfg.get("stft_hop", 512))
+    duration = n / float(sr)
+    shared_times = params.get("partial_times")
+
+    # Empty STFT shaped like a real analysis
+    n_frames = 1 + n // hop
+    S = np.zeros((n_fft // 2 + 1, n_frames), dtype=np.complex128)
+    frame_times = librosa.frames_to_time(np.arange(n_frames), sr=sr, hop_length=hop)
+    bin_hz = sr / float(n_fft)
+    window = np.hanning(n_fft)
+    amp_to_mag = float(np.sum(window)) / 2.0  # inverse of analysis mag_to_amp
+
+    for partial in params.get("partials", []):
+        times = np.asarray(
+            partial.get("times") or shared_times or [0.0, duration],
+            dtype=np.float64,
+        )
+        freq_cp = np.asarray(partial["frequency_hz"], dtype=np.float64)
+        amp_cp = np.asarray(partial["amplitude"], dtype=np.float64)
+        phase_cp = np.asarray(partial.get("phase") or [0.0], dtype=np.float64)
+
+        freq = _interp(times, freq_cp, frame_times)
+        amp = _interp(times, amp_cp, frame_times)
+        if len(phase_cp) >= 2:
+            # Interpolate unwrapped phase in a continuity-preserving way
+            phase = np.interp(frame_times, times, np.unwrap(phase_cp)).astype(np.float64)
+        else:
+            # IF from initial phase across frames
+            phase0 = float(phase_cp[0])
+            dphi = 2.0 * np.pi * freq * hop / sr
+            phase = phase0 + np.cumsum(dphi)
+            phase = np.concatenate([[phase0], phase[:-1]])
+
+        for ti in range(n_frames):
+            f = float(freq[ti])
+            a = float(amp[ti])
+            if a <= 1e-12 or f <= 0 or f >= sr * 0.5:
+                continue
+            bin_f = f / bin_hz
+            k0 = int(np.floor(bin_f))
+            frac = bin_f - k0
+            mag = a * amp_to_mag
+            c = mag * np.exp(1j * phase[ti])
+            # Split across adjacent bins (linear) to reduce scalloping
+            if 0 <= k0 < S.shape[0]:
+                S[k0, ti] += c * (1.0 - frac)
+            if 0 <= k0 + 1 < S.shape[0]:
+                S[k0 + 1, ti] += c * frac
+
+    y = librosa.istft(S, hop_length=hop, win_length=n_fft, length=n)
+    return np.asarray(y, dtype=np.float64)
+
+
 def synthesize_harmonics_only(
     params: dict[str, Any],
     *,
     apply_global_envelope: bool = False,
 ) -> NDArray:
-    """Sum oscillating partials from frequency/amplitude trajectories.
-
-    Phase: integrate 2π f(t)/sr (continuous instantaneous frequency) and add
-    the initial stored phase at t=0. Stored phase trajectories are kept for
-    inspection; using IF integration avoids phase discontinuities from
-    downsampling.
-    """
+    """Sum harmonic partials from frequency/amplitude/phase trajectories."""
     meta = params["meta"]
     sr = int(meta["sample_rate"])
     duration = float(meta["duration"])
     n = int(meta.get("n_samples") or round(duration * sr))
     t = np.arange(n, dtype=np.float64) / sr
 
-    out = np.zeros(n, dtype=np.float64)
-    shared_times = params.get("partial_times")
-    n_fft = int((params.get("analysis_config") or {}).get("stft_n_fft", 4096))
-    for partial in params.get("partials", []):
-        times = partial.get("times") or shared_times or [0.0, duration]
-        freq = _interp(times, partial["frequency_hz"], t)
-        amp = _interp(times, partial["amplitude"], t)
-        phase_cp = partial.get("phase") or [0.0]
-        phase0 = float(phase_cp[0])
-        # Instantaneous frequency integration from t=0.
-        # STFT phase is referenced near the first frame center (~n_fft/2 samples).
-        f_start = float(freq[0]) if len(freq) else 0.0
-        phase0 = phase0 - 2.0 * np.pi * f_start * (n_fft * 0.5) / sr
-        phase = phase0 + 2.0 * np.pi * np.cumsum(freq) / sr
-        out += amp * np.cos(phase)
+    out = _synthesize_partials_stft(params, n, sr)
 
     if apply_global_envelope and "amplitude_envelope" in params:
         env = params["amplitude_envelope"]

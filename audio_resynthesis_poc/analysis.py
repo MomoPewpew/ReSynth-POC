@@ -246,16 +246,15 @@ def _extract_partials(
 
         a_cp = _interp_series(frame_times, amps, np.asarray(t_cp)).tolist()
         f_cp = _interp_series(frame_times, frqs, np.asarray(t_cp)).tolist()
-        # Initial phase only — synthesis integrates instantaneous frequency.
-        # (Full phase trajectories are large and were not improving reconstruction.)
-        phase0 = float(phs[0]) if len(phs) else 0.0
+        # Unwrapped phase at control points — required for cubic (MQ) synthesis.
+        p_cp = _interp_series(frame_times, phs, np.asarray(t_cp)).tolist()
         partials.append(
             {
                 "id": k,
                 "times": t_cp,
                 "frequency_hz": f_cp,
                 "amplitude": a_cp,
-                "phase": [phase0],
+                "phase": p_cp,
             }
         )
     return partials
@@ -448,8 +447,10 @@ def analyze_audio(
     audio = np.asarray(audio, dtype=np.float64).reshape(-1)
     duration = len(audio) / float(sample_rate)
 
-    # Longer sounds need denser trajectories; keep CLI/config as a floor.
-    min_pts = max(cfg.partial_control_points, int(np.ceil(duration * 24)))
+    # Match control-point density to the STFT hop so phase/amp tracks stay usable.
+    # (Aggressive downsampling was destroying reconstruction on real instruments.)
+    frames_est = max(2, int(np.ceil(duration * sample_rate / float(cfg.stft_hop))) + 1)
+    min_pts = max(cfg.partial_control_points, min(frames_est, 512))
     if min_pts > cfg.partial_control_points:
         cfg.partial_control_points = min_pts
         cfg.envelope_points = max(cfg.envelope_points, min_pts)
