@@ -103,7 +103,9 @@ def interpolate_parameters(
     b = params_b
     dur_a = float(a["meta"]["duration"])
     dur_b = float(b["meta"]["duration"])
-    dur = _lerp(dur_a, dur_b, t)
+    # Keep A's duration. Stretching/compressing while reusing STFT phases
+    # desynchronizes phase from frequency and produces metallic/bell tones.
+    dur = dur_a
     sr_a = int(a["meta"]["sample_rate"])
     sr_b = int(b["meta"]["sample_rate"])
     if sr_a != sr_b:
@@ -117,15 +119,19 @@ def interpolate_parameters(
         len((a.get("noise") or {}).get("band_freqs_hz") or []),
         len((b.get("noise") or {}).get("band_freqs_hz") or []),
     )
-    if n_grid is None:
-        n_grid = int(
-            max(
-                cfg_a.get("partial_control_points", 64),
-                cfg_b.get("partial_control_points", 64),
-                64,
-            )
-        )
-    unit = np.linspace(0.0, 1.0, n_grid)
+    # Keep A's normalized control-point schedule (attack densification).
+    # A uniform linspace grid was remapping trajectories and making morphs
+    # sound like bright partials/bells even when A≈B.
+    times_a = a.get("partial_times") or (
+        a["partials"][0].get("times") if a.get("partials") else [0.0, dur_a]
+    )
+    times_b = b.get("partial_times") or (
+        b["partials"][0].get("times") if b.get("partials") else [0.0, dur_b]
+    )
+    unit = _norm_times(times_a, dur_a)
+    if n_grid is not None and n_grid != len(unit):
+        unit = np.linspace(0.0, 1.0, int(n_grid))
+    n_grid = len(unit)
 
     # --- fundamental (log-Hz) ---
     f0_a = _resample_on_unit(
@@ -147,9 +153,7 @@ def interpolate_parameters(
     env_peak = max(float(np.max(env)), 1e-12)
     env = env / env_peak
 
-    # --- partials: ratios + amps ---
-    times_a = a.get("partial_times") or (a["partials"][0].get("times") if a["partials"] else [0.0, dur_a])
-    times_b = b.get("partial_times") or (b["partials"][0].get("times") if b["partials"] else [0.0, dur_b])
+    # --- partials: ratios + amps + phase ---
     partials_out: list[dict[str, Any]] = []
     for k in range(n_partials):
         pa = a["partials"][k]
@@ -165,15 +169,18 @@ def interpolate_parameters(
         amp_b = _resample_on_unit(times_b, pb["amplitude"], dur_b, unit)
         amp = _log1p_lerp(amp_a, amp_b, t)
 
-        # Phase from nearer endpoint (do not morph) — keep full trajectory for MQ synth
-        phase_src = pa if t < 0.5 else pb
-        times_src = times_a if t < 0.5 else times_b
-        dur_src = dur_a if t < 0.5 else dur_b
-        phase_raw = phase_src.get("phase") or [0.0]
-        if len(phase_raw) >= 2:
-            phase = _resample_on_unit(times_src, phase_raw, dur_src, unit).tolist()
+        # Independently recorded notes have unrelated absolute phases.
+        # Lerping those phases (or mixing one note's phase with another's
+        # frequencies) creates metallic/bell artifacts. Keep A's measured
+        # phase for all interior morphs; t=0/t=1 use exact endpoints via
+        # early return above.
+        phase_raw_a = pa.get("phase") or [0.0]
+        if len(phase_raw_a) >= 2:
+            phase = _resample_on_unit(
+                times_a, np.unwrap(_as_f64(phase_raw_a)), dur_a, unit
+            ).tolist()
         else:
-            phase = [float(phase_raw[0])] * len(unit)
+            phase = [float(phase_raw_a[0])]
 
         partials_out.append(
             {

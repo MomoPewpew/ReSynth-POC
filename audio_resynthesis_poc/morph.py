@@ -47,6 +47,12 @@ def main() -> None:
         help="Silence between steps in seconds",
     )
     parser.add_argument(
+        "--trim",
+        type=float,
+        default=None,
+        help="Trim each morph step to this many seconds (from the start)",
+    )
+    parser.add_argument(
         "--save-params",
         action="store_true",
         help="Also write parameters_tXX.json for each step",
@@ -70,12 +76,18 @@ def main() -> None:
     gap = np.zeros(int(round(args.gap * sr)), dtype=np.float64)
     chunks: list[np.ndarray] = []
     ts = np.linspace(0.0, 1.0, args.steps)
+    trim_n = int(round(args.trim * sr)) if args.trim is not None else None
 
     print(f"Rendering {args.steps} morph steps (0% → 100%)...\n")
     for i, t in enumerate(ts):
         pct = int(round(100 * t))
         params = interpolate_parameters(a, b, float(t))
         y = synthesize(params)
+        if trim_n is not None:
+            if len(y) >= trim_n:
+                y = y[:trim_n]
+            else:
+                y = np.pad(y, (0, trim_n - len(y)))
         # Peak-normalize each step lightly for comparable listening level
         peak = float(np.max(np.abs(y))) if len(y) else 0.0
         if peak > 1e-9:
@@ -85,7 +97,7 @@ def main() -> None:
             chunks.append(gap)
         print(
             f"  step {i:2d}: {pct:3d}%  "
-            f"dur={params['meta']['duration']:.3f}s  "
+            f"dur={len(y)/sr:.3f}s  "
             f"f0≈{params['fundamental']['frequency_hz_mean']:.1f} Hz  "
             f"samples={len(y):,}"
         )
